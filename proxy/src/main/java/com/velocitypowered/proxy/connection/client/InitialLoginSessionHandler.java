@@ -32,9 +32,11 @@ import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.crypto.IdentifiedKey;
 import com.velocitypowered.api.util.GameProfile;
 import com.velocitypowered.proxy.VelocityServer;
+import com.velocitypowered.proxy.config.VelocityConfiguration;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
 import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackTransfer;
+import com.velocitypowered.proxy.connection.util.FallbackServers;
 import com.velocitypowered.proxy.crypto.IdentifiedKeyImpl;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
@@ -72,10 +74,12 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
 
   private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
+  private static final String MOJANG_HASJOINED_GET_PARAMS = "?username=%s&serverId=%s";
+
   private static final String MOJANG_HASJOINED_URL =
       System.getProperty("mojang.sessionserver",
               "https://sessionserver.mojang.com/session/minecraft/hasJoined")
-          .concat("?username=%s&serverId=%s");
+          .concat(MOJANG_HASJOINED_GET_PARAMS);
 
   private final VelocityServer server;
 
@@ -86,6 +90,8 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
   private @MonotonicNonNull ServerLoginPacket login;
 
   private byte[] verify = EMPTY_BYTE_ARRAY;
+
+  private boolean authenticateWithMojang;
 
   private LoginState currentState = LoginState.LOGIN_PACKET_EXPECTED;
 
@@ -100,6 +106,13 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
     this.inbound = Preconditions.checkNotNull(inbound, "inbound");
     this.forceKeyAuthentication = VelocityProperties.readBoolean(
         "auth.forceSecureProfiles", server.getConfiguration().isForceKeyAuthentication());
+  }
+
+  private String resolveHasJoinedUrl() {
+    return FallbackServers.getForcedHostEntry(server.getConfiguration(), inbound)
+        .map(VelocityConfiguration.ForcedHostEntry::getSessionServer)
+        .map(baseUrl -> baseUrl.concat(MOJANG_HASJOINED_GET_PARAMS))
+        .orElse(MOJANG_HASJOINED_URL);
   }
 
   @Override
@@ -168,10 +181,16 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
         }
 
         mcConnection.eventLoop().execute(() -> {
-          if (!result.isForceOfflineMode()
-              && (server.getConfiguration().isOnlineMode() || result.isOnlineModeAllowed())) {
+          boolean onlineAuth = !result.isForceOfflineMode()
+              && (server.getConfiguration().isOnlineMode() || result.isOnlineModeAllowed());
+          boolean offlineEncryption = !onlineAuth
+              && server.getConfiguration().isOfflineModeEncryptionEnabled()
+              && mcConnection.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_5);
+
+          if (onlineAuth || offlineEncryption) {
             // Request encryption.
-            EncryptionRequestPacket request = generateEncryptionRequest();
+            EncryptionRequestPacket request = generateEncryptionRequest(onlineAuth);
+            this.authenticateWithMojang = onlineAuth;
             this.verify = Arrays.copyOf(request.getVerifyToken(), 4);
             mcConnection.write(request);
             this.currentState = LoginState.ENCRYPTION_REQUEST_SENT;
@@ -230,9 +249,16 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
       // is enabled.
       mcConnection.enableEncryption(decryptedSharedSecret);
 
+      if (!authenticateWithMojang) {
+        mcConnection.setActiveSessionHandler(StateRegistry.LOGIN,
+            new AuthSessionHandler(server, inbound,
+                GameProfile.forOfflinePlayer(login.getUsername()), false, null, appliedResourcePacksFuture));
+        return true;
+      }
+
       String serverId = generateServerId(decryptedSharedSecret, serverKeyPair.getPublic());
       String playerIp = ((InetSocketAddress) mcConnection.getRemoteAddress()).getHostString();
-      String url = String.format(MOJANG_HASJOINED_URL, urlFormParameterEscaper().escape(login.getUsername()), serverId);
+      String url = String.format(resolveHasJoinedUrl(), urlFormParameterEscaper().escape(login.getUsername()), serverId);
 
       if (server.getConfiguration().shouldPreventClientProxyConnections()) {
         url += "&ip=" + urlFormParameterEscaper().escape(playerIp);
@@ -298,13 +324,14 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
     return false;
   }
 
-  private EncryptionRequestPacket generateEncryptionRequest() {
+  private EncryptionRequestPacket generateEncryptionRequest(boolean shouldAuthenticate) {
     byte[] verify = new byte[4];
     SECURE_RANDOM.nextBytes(verify);
 
     EncryptionRequestPacket request = new EncryptionRequestPacket();
     request.setPublicKey(server.getServerKeyPair().getPublic().getEncoded());
     request.setVerifyToken(verify);
+    request.setShouldAuthenticate(shouldAuthenticate);
     return request;
   }
 
