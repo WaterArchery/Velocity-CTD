@@ -83,7 +83,7 @@ public abstract non-sealed class AbstractDepotService<K, V extends DepotEntry<K,
    */
   @Override
   public @NotNull Collection<V> queryAll(Predicate<V> predicate) {
-    return this.depot.values().stream().filter(predicate).toList();
+    return this.getAll().stream().filter(predicate).toList();
   }
 
   @Override

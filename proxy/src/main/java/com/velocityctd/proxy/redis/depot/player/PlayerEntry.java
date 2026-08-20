@@ -99,6 +99,7 @@ public final class PlayerEntry extends DepotEntry<UUID, PlayerEntry> {
     this.username = player.getUsername();
     this.proxyId = proxyId;
     this.queuePriority = new HashMap<>(player.getQueuePriorities());
+    this.queuePriority.values().removeIf(priority -> priority == 0);
     this.fullServerBypass = player.hasPermission("velocity.queue.full.bypass");
     this.queueBypass = player.hasPermission("velocity.queue.bypass");
     this.kickBypass = player.hasPermission("velocity.command.gkick.bypass");

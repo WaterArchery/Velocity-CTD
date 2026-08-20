@@ -40,6 +40,11 @@ import org.jetbrains.annotations.Unmodifiable;
 public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerEntry> {
 
   /**
+   * How long a cached getAll() result is reused.
+   */
+  private static final long SNAPSHOT_TTL_NANOS = Duration.ofSeconds(1L).toNanos();
+
+  /**
    * The Redis manager used to coordinate multi-proxy player synchronization.
    */
   private final VelocityRedis redis;
@@ -65,6 +70,11 @@ public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerE
    * The number of players currently recorded across all proxies.
    */
   private int totalPlayerCount = 0;
+
+  /**
+   * The last getAll() result, or null before the first read.
+   */
+  private volatile @Nullable Snapshot snapshot;
 
   /**
    * Constructs a new {@link PlayerDepotService}.
@@ -203,6 +213,21 @@ public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerE
   }
 
   /**
+   * Cached for about a second so frequent callers don't pull the whole
+   * player hash from Redis every time.
+   */
+  @Override
+  public @NotNull @Unmodifiable List<PlayerEntry> getAll() {
+    Snapshot current = this.snapshot;
+    if (current == null || System.nanoTime() - current.fetchedAt() >= SNAPSHOT_TTL_NANOS) {
+      current = new Snapshot(System.nanoTime(), super.getAll());
+      this.snapshot = current;
+    }
+
+    return current.entries();
+  }
+
+  /**
    * Get a player entry by their unique ID.
    *
    * @param uniqueId the unique ID of the player
@@ -219,7 +244,7 @@ public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerE
    * @return the player entry, or {@code null} if the player is not present in the depot
    */
   public @Nullable PlayerEntry getPlayerEntry(String username) {
-    for (PlayerEntry entry : this.depot.values()) {
+    for (PlayerEntry entry : this.getAll()) {
       if (entry.getUsername().equalsIgnoreCase(username)) {
         return entry;
       }
@@ -245,7 +270,7 @@ public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerE
    * @return {@code true} if the player is online, {@code false} otherwise
    */
   public boolean isPlayerOnline(String username) {
-    for (PlayerEntry entry : this.depot.values()) {
+    for (PlayerEntry entry : this.getAll()) {
       if (entry.getUsername().equalsIgnoreCase(username)) {
         return true;
       }
@@ -322,6 +347,7 @@ public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerE
       this.upsertPlayerEntry(player);
     }
 
+    // Don't use the getAll() cache here, cleanup needs fresh data.
     for (PlayerEntry playerEntry : this.depot.values()) {
       if (!playerEntry.getProxyId().equalsIgnoreCase(this.redis.getProxyId())) {
         continue;
@@ -334,4 +360,12 @@ public final class PlayerDepotService extends AbstractDepotService<UUID, PlayerE
       playerEntry.remove();
     }
   }
+
+  /**
+   * A cached getAll() result.
+   *
+   * @param fetchedAt when the entries were read
+   * @param entries the cached entries
+   */
+  private record Snapshot(long fetchedAt, @Unmodifiable List<PlayerEntry> entries) {}
 }
