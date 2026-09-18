@@ -136,6 +136,7 @@ public class CtdConfigMigrations {
         migration(null, "commands.ping-enabled", true),
         migration(null, "commands.plist-enabled", true),
         migration(null, "commands.transfer-enabled", true),
+        migration(null, "commands.shutdown-enabled-as-player", false),
         migration(
             "Whether to use the default \"/server\" output, or whether to override it "
                 + "with the \"velocity.command.server.usage\" key.",
@@ -388,7 +389,8 @@ public class CtdConfigMigrations {
             "most_empty"
         ),
 
-        new CtdAutoQueueServersMigration()
+        new CtdAutoQueueServersMigration(),
+        new CtdForcedHostPingMigration()
     );
   }
 
