@@ -137,11 +137,16 @@ public sealed class LegacyResourcePackHandler extends ResourcePackHandler
     final boolean peek = bundle.status().isIntermediate();
     final ResourcePackInfo queued = peek
             ? outstandingResourcePacks.peek() : outstandingResourcePacks.poll();
+    if (queued == null) {
+      // A client before 1.20.3 answers only the offer it was last sent, which stays outstanding
+      // until its final status; a status with nothing outstanding was never asked for.
+      return true;
+    }
 
-    UUID callbackId = queued != null ? queued.getId() : bundle.uuid();
-    dispatchPackCallback(callbackId, bundle.status())
-            .thenCompose(v -> server.getEventManager()
-                  .fire(new PlayerResourcePackStatusEvent(this.player, bundle.uuid(), bundle.status(), queued)))
+    dispatchPackCallback(queued.getId(), bundle.status());
+    server.getEventManager()
+            .fire(new PlayerResourcePackStatusEvent(
+                this.player, bundle.uuid(), bundle.status(), queued))
             .thenAcceptAsync(event -> {
               if (shouldDisconnectForForcePack(event)) {
                 event.getPlayer().disconnect(Component
@@ -161,7 +166,7 @@ public sealed class LegacyResourcePackHandler extends ResourcePackHandler
       }
       case FAILED_DOWNLOAD -> pendingResourcePack = null;
       case DISCARDED -> {
-        if (queued != null && queued.getId() != null
+        if (queued.getId() != null
                 && appliedResourcePack != null
                 && appliedResourcePack.getId().equals(queued.getId())) {
           appliedResourcePack = null;

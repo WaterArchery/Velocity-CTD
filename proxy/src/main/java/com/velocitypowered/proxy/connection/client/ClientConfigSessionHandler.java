@@ -83,9 +83,11 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
 
   private final VelocityServer server;
   private final ConnectedPlayer player;
+  private final PendingPluginMessages pendingPluginMessages;
   private String brandChannel = null;
 
   private CompletableFuture<?> configurationFuture;
+  private volatile boolean knownPacksResponseWaiting;
   private CompletableFuture<Void> configSwitchFuture;
 
   private boolean configuredOnce;
@@ -103,6 +105,7 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
   public ClientConfigSessionHandler(VelocityServer server, ConnectedPlayer player) {
     this.server = server;
     this.player = player;
+    this.pendingPluginMessages = new PendingPluginMessages(player);
   }
 
   @Override
@@ -113,6 +116,7 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
   @Override
   public void deactivated() {
     configurationFuture = null;
+    knownPacksResponseWaiting = false;
   }
 
   @Override
@@ -124,6 +128,17 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
   @Override
   public boolean handle(ClientSettingsPacket packet) {
     player.setClientSettings(packet);
+    // LoginSessionHandler replays settings already available when the backend enters CONFIG.
+    // Settings arriving later must also reach that backend, rather than only updating the proxy.
+    VelocityServerConnection targetServer = player.getConnectionInFlightOrConnectedServer();
+    if (targetServer != null) {
+      MinecraftConnection backend = targetServer.getConnection();
+      if (backend != null
+          && (backend.getState() == StateRegistry.CONFIG
+              || backend.getState() == StateRegistry.PLAY)) {
+        backend.write(packet);
+      }
+    }
     return true;
   }
 
@@ -146,7 +161,7 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(final PluginMessagePacket packet) {
-    final VelocityServerConnection serverConn = player.getConnectionInFlight();
+    final VelocityServerConnection serverConn = configurationTarget();
     if (PluginMessageUtil.isMcBrand(packet)) {
       final String brand = PluginMessageUtil.readBrandMessage(packet.content());
       server.getEventManager().fireAndForget(new PlayerClientBrandEvent(player, brand));
@@ -160,7 +175,15 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
       ChannelIdentifier id = this.server.getChannelRegistrar().getFromId(packet.getChannel());
 
       if (id == null) {
-        serverConn.ensureConnected().write(packet.retain());
+        final MinecraftConnection smc = serverConn.getConnection();
+        if (smc != null) {
+          smc.write(packet.retain());
+        }
+        return true;
+      }
+
+      int size = packet.content().readableBytes();
+      if (!pendingPluginMessages.reserve(size)) {
         return true;
       }
 
@@ -179,28 +202,39 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
           }, player.getConnection().eventLoop()).exceptionally((ex) -> {
             LOGGER.error("Exception while handling plugin message packet for {}", player, ex);
             return null;
-          });
+          }).whenComplete((ignored, ex) -> pendingPluginMessages.release(size));
     }
     return true;
   }
 
   @Override
   public boolean handle(PingIdentifyPacket packet) {
-    if (player.getConnectionInFlight() != null) {
-      player.getConnectionInFlight().ensureConnected().write(packet);
-      return true;
-    }
-
-    return false;
+    return writeToConnectionInFlight(packet);
   }
 
   @Override
   public boolean handle(KnownPacksPacket packet) {
+    if (knownPacksResponseWaiting) {
+      // A client answers each known packs request once, and a backend only asks again after it
+      // has the answer, so a second answer while the first still waits on the configuration
+      // event was never asked for. Holding it would keep another copy in memory for as long as
+      // the event runs.
+      if (MinecraftDecoder.DEBUG) {
+        LOGGER.info("{} sent a known packs response that was not requested", player);
+      }
+      player.disconnect(
+          Component.translatable("velocity.error.player-connection-error", NamedTextColor.RED));
+      return true;
+    }
+
+    knownPacksResponseWaiting = true;
     callConfigurationEvent().thenRun(() -> {
+      knownPacksResponseWaiting = false;
       VelocityServerConnection targetServer =
           player.getConnectionInFlightOrConnectedServer();
-      if (targetServer != null) {
-        targetServer.ensureConnected().write(packet);
+      final MinecraftConnection smc = targetServer == null ? null : targetServer.getConnection();
+      if (smc != null) {
+        smc.write(packet);
       }
     }).exceptionally(ex -> {
       LOGGER.error("Error forwarding known packs response to backend:", ex);
@@ -216,15 +250,16 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
         .fire(new CookieReceiveEvent(player, packet.getKey(), packet.getPayload()))
         .thenAcceptAsync(event -> {
           if (event.getResult().isAllowed()) {
-            final VelocityServerConnection serverConnection = player.getConnectionInFlight();
-            if (serverConnection != null) {
+            final VelocityServerConnection serverConnection = configurationTarget();
+            final MinecraftConnection smc =
+                serverConnection == null ? null : serverConnection.getConnection();
+            if (smc != null) {
               final Key resultedKey = event.getResult().getKey() == null
                   ? event.getOriginalKey() : event.getResult().getKey();
               final byte[] resultedData = event.getResult().getData() == null
                   ? event.getOriginalData() : event.getResult().getData();
 
-              serverConnection.ensureConnected()
-                  .write(new ServerboundCookieResponsePacket(resultedKey, resultedData));
+              smc.write(new ServerboundCookieResponsePacket(resultedKey, resultedData));
             }
           }
         }, player.getConnection().eventLoop());
@@ -236,7 +271,10 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
   public boolean handle(ServerboundCustomClickActionPacket packet) {
     VelocityServerConnection serverConnection = player.getConnectionInFlightOrConnectedServer();
     if (serverConnection != null) {
-      serverConnection.ensureConnected().write(packet.retain());
+      final MinecraftConnection smc = serverConnection.getConnection();
+      if (smc != null) {
+        smc.write(packet.retain());
+      }
       return true;
     }
 
@@ -245,12 +283,47 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(CodeOfConductAcceptPacket packet) {
-    if (this.player.getConnectionInFlight() != null) {
-      this.player.getConnectionInFlight().ensureConnected().write(packet);
-      return true;
+    return writeToConnectionInFlight(packet);
+  }
+
+  /**
+   * Forwards a packet to the server connection in flight, if there is one. A connection in flight
+   * that is still connecting, or already gone, takes nothing, rather than the player being
+   * disconnected for it.
+   *
+   * @param packet the packet to forward
+   * @return whether a connection was in flight
+   */
+  private boolean writeToConnectionInFlight(MinecraftPacket packet) {
+    final VelocityServerConnection inFlight = player.getConnectionInFlight();
+    if (inFlight == null) {
+      return false;
     }
 
-    return false;
+    final MinecraftConnection smc = inFlight.getConnection();
+    if (smc != null) {
+      smc.write(packet);
+    }
+    return true;
+  }
+
+  /**
+   * Returns the backend the player is being configured for: the one in flight, or else the
+   * connected server when it is the one that sent the player back to configuration, which leaves
+   * it in CONFIG itself. Without it, what the client answers during a reconfiguration the backend
+   * started was dropped.
+   *
+   * @return the backend being configured, or {@code null} if there is none
+   */
+  private @Nullable VelocityServerConnection configurationTarget() {
+    final VelocityServerConnection inFlight = player.getConnectionInFlight();
+    if (inFlight != null) {
+      return inFlight;
+    }
+
+    final VelocityServerConnection connected = player.getConnectedServer();
+    final MinecraftConnection smc = connected == null ? null : connected.getConnection();
+    return smc != null && smc.getState() == StateRegistry.CONFIG ? connected : null;
   }
 
   @Override
@@ -325,7 +398,7 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
     if (serverConn != null) {
       final MinecraftConnection smc = serverConn.getConnection();
       if (smc != null) {
-        smc.setAutoReading(writable);
+        smc.setPausedForBackpressure(!writable);
       }
     }
   }

@@ -58,6 +58,13 @@ public class GameSpyQueryHandler extends SimpleChannelInboundHandler<DatagramPac
   private static final byte QUERY_TYPE_HANDSHAKE = 0x09;
   private static final byte QUERY_TYPE_STAT = 0x00;
 
+  /**
+   * Minimum valid query message length: 2 magic bytes + 1 type byte + 4 session id bytes.
+   * The {@link #QUERY_TYPE_HANDSHAKE} branch is the shortest handler — it only reads this
+   * header, so any message shorter than 7 bytes is always malformed.
+   */
+  private static final int MINIMUM_MESSAGE_LENGTH = 7;
+
   private static final byte[] QUERY_RESPONSE_FULL_PADDING = {
       0x73, 0x70, 0x6C, 0x69, 0x74, 0x6E, 0x75, 0x6D, 0x00, (byte) 0x80, 0x00
   };
@@ -76,8 +83,13 @@ public class GameSpyQueryHandler extends SimpleChannelInboundHandler<DatagramPac
       "hostip"
   );
 
+  // A handshake stores a challenge for its sender address, and a UDP sender address can be forged,
+  // so without a bound a flood of handshakes from made-up addresses grows this for 30 seconds each.
+  private static final int MAX_SESSIONS = 10_000;
+
   private final Cache<InetAddress, Integer> sessions = Caffeine.newBuilder()
       .expireAfterWrite(30, TimeUnit.SECONDS)
+      .maximumSize(MAX_SESSIONS)
       .build();
   private final SecureRandom random;
   private final VelocityServer server;
@@ -108,6 +120,10 @@ public class GameSpyQueryHandler extends SimpleChannelInboundHandler<DatagramPac
     ByteBuf queryMessage = msg.content();
     InetAddress senderAddress = msg.sender().getAddress();
 
+    if (queryMessage.readableBytes() < MINIMUM_MESSAGE_LENGTH) {
+      return;
+    }
+
     // Verify query packet magic
     if (queryMessage.readUnsignedByte() != QUERY_MAGIC_FIRST
         || queryMessage.readUnsignedByte() != QUERY_MAGIC_SECOND) {
@@ -135,6 +151,11 @@ public class GameSpyQueryHandler extends SimpleChannelInboundHandler<DatagramPac
       }
 
       case QUERY_TYPE_STAT -> {
+        // Need at least 4 more bytes for challenge token
+        if (queryMessage.readableBytes() < 4) {
+          return;
+        }
+
         // Check if query was done with session previously generated using a handshake packet
         int challengeToken = queryMessage.readInt();
         Integer session = sessions.getIfPresent(senderAddress);
